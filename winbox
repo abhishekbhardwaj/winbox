@@ -35,6 +35,7 @@
 #   logs          - Show container logs (useful for debugging)
 #   config        - Display the current docker-compose.yml configuration
 #   edit          - Modify VM settings (RAM, CPU, disk, ports, etc.)
+#   secure        - Configure web viewer security (add password or disable)
 #   firewall      - Show commands to open firewall ports for LAN access
 #   update        - Check for and pull latest dockurr/windows image
 #   self-update   - Update this script to the latest version from GitHub
@@ -78,6 +79,10 @@
 #                 Set to "Y" to disable automatic installation
 #   DHCP        - Get IP from router via macvlan (default: not set)
 #                 Set to "Y" to enable (requires additional network setup)
+#   USER        - Web viewer (VNC) username (default: not set)
+#                 Only used when PASS is also set to enable authentication
+#   PASS        - Web viewer (VNC) password (default: not set)
+#                 Setting this enables HTTP Basic Auth on port 8006
 #
 # VOLUMES:
 #   /storage    - Primary storage for VM disk image
@@ -87,6 +92,8 @@
 #
 # PORTS:
 #   8006        - Web-based VNC viewer (for installation monitoring)
+#                 Can be password-protected with USER/PASS env vars
+#                 Can be disabled entirely by removing the port mapping
 #   3389        - RDP (Remote Desktop Protocol) for normal usage
 #
 # ACCESSING THE VM:
@@ -95,6 +102,22 @@
 #      - Windows: mstsc.exe
 #      - Linux: freerdp, remmina
 #      - macOS: Microsoft Remote Desktop
+#
+# WEB VIEWER SECURITY:
+#   The web viewer (port 8006) provides browser-based access during installation.
+#   By default it has NO authentication, which is fine for trusted local networks.
+#
+#   Security options (configurable during install or via 'winbox secure'):
+#   1. No protection - convenient but anyone can view/control the VM
+#   2. Password protect - uses HTTP Basic Auth (same credentials as Windows login)
+#   3. Disable entirely - removes port mapping, use RDP only
+#
+#   To change security settings after installation:
+#     ./winbox secure
+#
+#   Manual configuration in docker-compose.yml:
+#     - Add password: Set USER and PASS environment variables
+#     - Disable viewer: Remove the 8006 port mapping
 #
 # INTEL iGPU PASSTHROUGH:
 #   If your system has an Intel CPU with integrated graphics, you can enable
@@ -712,6 +735,59 @@ install_windows() {
     echo ""
     WIN_PASS=${WIN_PASS:-admin}
 
+    # --- Web Viewer Security ---
+    log_header "Web Viewer Security"
+    echo "The web viewer (port $WEB_PORT) allows browser-based access to the VM."
+    echo ""
+    echo "By default, it has NO authentication - anyone who can reach the port can view/control the VM."
+    echo ""
+    echo "Options:"
+    echo "  1) No protection (default) - convenient for local/trusted networks"
+    echo "  2) Password protect - uses same credentials as Windows ($WIN_USER)"
+    echo "  3) Password protect - use custom credentials"
+    echo "  4) Disable web viewer - remove port entirely (RDP only access)"
+    echo ""
+    read -p "Choose security option [1-4, Default: 1]: " VNC_SECURITY
+    VNC_SECURITY=${VNC_SECURITY:-1}
+    
+    VNC_USER_ENV=""
+    VNC_PASS_ENV=""
+    DISABLE_WEB_VIEWER=""
+    
+    case "$VNC_SECURITY" in
+        2)
+            # Use same credentials as Windows login
+            VNC_USER_ENV="USER: \"$WIN_USER\""
+            VNC_PASS_ENV="PASS: \"$WIN_PASS\""
+            log_success "Web viewer will be password protected (same credentials as Windows)"
+            ;;
+        3)
+            # Custom credentials
+            read -p "Enter web viewer username [Default: admin]: " VNC_USER
+            VNC_USER=${VNC_USER:-admin}
+            while true; do
+                read -s -p "Enter web viewer password: " VNC_PASS
+                echo ""
+                if [ -n "$VNC_PASS" ]; then
+                    break
+                fi
+                log_error "Password cannot be empty."
+            done
+            VNC_USER_ENV="USER: \"$VNC_USER\""
+            VNC_PASS_ENV="PASS: \"$VNC_PASS\""
+            log_success "Web viewer will be password protected (custom credentials)"
+            ;;
+        4)
+            DISABLE_WEB_VIEWER="Y"
+            log_warn "Web viewer will be disabled. Use RDP to access the VM."
+            echo ""
+            echo "Note: You can still monitor installation progress via: winbox logs"
+            ;;
+        *)
+            log_info "Web viewer will have no authentication"
+            ;;
+    esac
+
     # --- Shared Folder ---
     log_header "Shared Folder"
     echo "Create a folder that's accessible from both Linux host and Windows VM."
@@ -809,6 +885,10 @@ install_windows() {
       $GPU_ENV"
     [ -n "$MANUAL_ENV" ] && ENV_SECTION="$ENV_SECTION
       $MANUAL_ENV"
+    [ -n "$VNC_USER_ENV" ] && ENV_SECTION="$ENV_SECTION
+      $VNC_USER_ENV"
+    [ -n "$VNC_PASS_ENV" ] && ENV_SECTION="$ENV_SECTION
+      $VNC_PASS_ENV"
 
     # Build devices section
     DEVICES_SECTION="    devices:
@@ -825,6 +905,18 @@ install_windows() {
     [ -n "$OEM_VOLUME" ] && VOLUMES_SECTION="$VOLUMES_SECTION
       $OEM_VOLUME"
 
+    # Build ports section
+    if [ -n "$DISABLE_WEB_VIEWER" ]; then
+        PORTS_SECTION="    ports:
+      - ${RDP_PORT}:3389/tcp
+      - ${RDP_PORT}:3389/udp"
+    else
+        PORTS_SECTION="    ports:
+      - ${WEB_PORT}:8006
+      - ${RDP_PORT}:3389/tcp
+      - ${RDP_PORT}:3389/udp"
+    fi
+
     # Generate compose file
     cat > "$COMPOSE_FILE" << EOF
 # Windows VM Docker Compose Configuration
@@ -838,10 +930,7 @@ services:
 $ENV_SECTION
     cap_add:
       - NET_ADMIN
-    ports:
-      - ${WEB_PORT}:8006
-      - ${RDP_PORT}:3389/tcp
-      - ${RDP_PORT}:3389/udp
+$PORTS_SECTION
 $VOLUMES_SECTION
 $DEVICES_SECTION
     restart: unless-stopped
@@ -863,7 +952,16 @@ EOF
     echo "  Disk Size:        $DISK_SIZE"
     echo "  Username:         $WIN_USER"
     echo "  Language:         $LANGUAGE"
-    echo "  Web Viewer Port:  $WEB_PORT"
+    if [ -n "$DISABLE_WEB_VIEWER" ]; then
+        echo "  Web Viewer:       Disabled (RDP only)"
+    else
+        echo "  Web Viewer Port:  $WEB_PORT"
+        if [ -n "$VNC_PASS_ENV" ]; then
+            echo "  Web Viewer Auth:  Password protected"
+        else
+            echo "  Web Viewer Auth:  None (open access)"
+        fi
+    fi
     echo "  RDP Port:         $RDP_PORT"
     echo "  Intel iGPU:       $([ -n "$GPU_ENV" ] && echo "Enabled" || echo "Disabled")"
     echo "  Shared Folder:    $([ -n "$SHARED_VOLUME" ] && echo "$SHARED_DIR" || echo "Disabled")"
@@ -935,11 +1033,13 @@ show_connection_info() {
     local RDP_PORT=$(grep -E '^\s+-\s+[0-9]+:3389' "$COMPOSE_FILE" | head -1 | sed 's/.*- \([0-9]*\):3389.*/\1/')
     local USERNAME=$(grep -E '^\s+USERNAME:' "$COMPOSE_FILE" | sed 's/.*USERNAME: *"\?\([^"]*\)"\?.*/\1/' | tr -d ' ')
     local PASSWORD=$(grep -E '^\s+PASSWORD:' "$COMPOSE_FILE" | sed 's/.*PASSWORD: *"\?\([^"]*\)"\?.*/\1/' | tr -d ' ')
+    local VNC_PASS=$(grep -E '^\s+PASS:' "$COMPOSE_FILE" | sed 's/.*PASS: *"\?\([^"]*\)"\?.*/\1/' | tr -d ' ')
+    local VNC_USER=$(grep -E '^\s+USER:' "$COMPOSE_FILE" | sed 's/.*USER: *"\?\([^"]*\)"\?.*/\1/' | tr -d ' ')
     
-    WEB_PORT=${WEB_PORT:-8006}
     RDP_PORT=${RDP_PORT:-3389}
     USERNAME=${USERNAME:-Docker}
     PASSWORD=${PASSWORD:-admin}
+    VNC_USER=${VNC_USER:-admin}
 
     # Try to get server IP
     local SERVER_IP=$(hostname -I | awk '{print $1}')
@@ -949,19 +1049,37 @@ show_connection_info() {
     echo "│                      CONNECTION DETAILS                          │"
     echo "├──────────────────────────────────────────────────────────────────┤"
     echo "│                                                                  │"
-    echo -e "│  ${BOLD}During Installation (temporary):${NC}                             │"
-    echo "│    Web Viewer: http://${SERVER_IP}:${WEB_PORT}"
-    echo "│    (Low quality, no audio - just for monitoring install)        │"
-    echo "│                                                                  │"
+    
+    if [ -n "$WEB_PORT" ]; then
+        echo -e "│  ${BOLD}During Installation (temporary):${NC}                             │"
+        echo "│    Web Viewer: http://${SERVER_IP}:${WEB_PORT}"
+        if [ -n "$VNC_PASS" ]; then
+            echo "│    (Password protected: ${VNC_USER} / ${VNC_PASS})"
+        else
+            echo "│    (No authentication - open access)"
+        fi
+        echo "│    (Low quality, no audio - just for monitoring install)        │"
+        echo "│                                                                  │"
+    else
+        echo -e "│  ${BOLD}Web Viewer: DISABLED${NC}                                        │"
+        echo "│    Monitor installation progress via: winbox logs               │"
+        echo "│                                                                  │"
+    fi
+    
     echo -e "│  ${BOLD}After Installation (recommended):${NC}                            │"
     echo "│    RDP: ${SERVER_IP}:${RDP_PORT}"
     echo "│    (Full quality, audio, clipboard, better performance)         │"
     echo "│                                                                  │"
-    echo "│  Credentials: ${USERNAME} / ${PASSWORD}"
+    echo "│  Windows Credentials: ${USERNAME} / ${PASSWORD}"
     echo "│                                                                  │"
     echo "└──────────────────────────────────────────────────────────────────┘"
     echo ""
-    log_info "Installation takes 10-20 minutes. Monitor progress via Web Viewer."
+    
+    if [ -n "$WEB_PORT" ]; then
+        log_info "Installation takes 10-20 minutes. Monitor progress via Web Viewer."
+    else
+        log_info "Installation takes 10-20 minutes. Monitor progress via 'winbox logs'."
+    fi
     echo ""
     echo -e "${BOLD}RDP Clients:${NC}"
     echo "  Windows: mstsc (built-in, press Win+R, type 'mstsc')"
@@ -1119,10 +1237,11 @@ edit_vm() {
     echo "  2) CPU cores"
     echo "  3) RDP port"
     echo "  4) Web viewer port"
-    echo "  5) View current config"
-    echo "  6) Cancel"
+    echo "  5) Web viewer security"
+    echo "  6) View current config"
+    echo "  7) Cancel"
     echo ""
-    read -p "Enter choice [1-6]: " EDIT_CHOICE
+    read -p "Enter choice [1-7]: " EDIT_CHOICE
 
     case "$EDIT_CHOICE" in
         1)
@@ -1192,9 +1311,14 @@ edit_vm() {
             done
             ;;
         5)
+            # Redirect to the secure command
+            secure_vm
+            return
+            ;;
+        6)
             show_config
             ;;
-        6|*)
+        7|*)
             log_info "No changes made."
             return
             ;;
@@ -1385,6 +1509,168 @@ show_firewall() {
     fi
 }
 
+# Secure web viewer
+secure_vm() {
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        log_error "No configuration found. Run '$0 install' first."
+        exit 1
+    fi
+
+    # Check current state
+    local has_web_port=$(grep -E '^\s+-\s+[0-9]+:8006' "$COMPOSE_FILE")
+    local has_vnc_pass=$(grep -E '^\s+PASS:' "$COMPOSE_FILE")
+    local has_vnc_user=$(grep -E '^\s+USER:' "$COMPOSE_FILE")
+    
+    log_header "Web Viewer Security"
+    
+    echo "Current status:"
+    if [ -z "$has_web_port" ]; then
+        echo "  Web viewer: DISABLED (port not exposed)"
+        echo ""
+        echo "The web viewer is already disabled. Only RDP access is available."
+        echo ""
+        read -p "Would you like to re-enable it? (y/N): " ENABLE_WEB
+        if [[ "$ENABLE_WEB" =~ ^[yY] ]]; then
+            # Get RDP port to avoid conflicts
+            local RDP_PORT=$(grep -E '^\s+-\s+[0-9]+:3389' "$COMPOSE_FILE" | head -1 | sed 's/.*- \([0-9]*\):3389.*/\1/')
+            RDP_PORT=${RDP_PORT:-3389}
+            
+            while true; do
+                read -p "Enter Web viewer port [Default: 8006]: " NEW_WEB_PORT
+                NEW_WEB_PORT=${NEW_WEB_PORT:-8006}
+                if validate_port "$NEW_WEB_PORT" && [ "$NEW_WEB_PORT" != "$RDP_PORT" ]; then
+                    break
+                fi
+                log_error "Invalid port or same as RDP port ($RDP_PORT)"
+            done
+            
+            # Add web port back - insert before RDP port line
+            sed -i "/- ${RDP_PORT}:3389\/tcp/i\\      - ${NEW_WEB_PORT}:8006" "$COMPOSE_FILE"
+            log_success "Web viewer re-enabled on port $NEW_WEB_PORT"
+            
+            # Ask about password protection
+            read -p "Add password protection? (y/N): " ADD_PASS
+            if [[ "$ADD_PASS" =~ ^[yY] ]]; then
+                add_vnc_password
+            fi
+        fi
+        prompt_restart_if_running
+        return
+    fi
+    
+    local WEB_PORT=$(echo "$has_web_port" | head -1 | sed 's/.*- \([0-9]*\):8006.*/\1/')
+    
+    if [ -n "$has_vnc_pass" ]; then
+        echo "  Web viewer: PROTECTED (password required on port $WEB_PORT)"
+    else
+        echo "  Web viewer: OPEN (no authentication on port $WEB_PORT)"
+    fi
+    echo ""
+    
+    echo "Options:"
+    echo "  1) Add/change password protection"
+    echo "  2) Remove password protection"
+    echo "  3) Disable web viewer entirely (RDP only)"
+    echo "  4) Cancel"
+    echo ""
+    read -p "Choose option [1-4]: " SECURE_CHOICE
+    
+    case "$SECURE_CHOICE" in
+        1)
+            add_vnc_password
+            ;;
+        2)
+            if [ -z "$has_vnc_pass" ]; then
+                log_info "Password protection is not currently enabled."
+            else
+                # Remove USER and PASS lines
+                sed -i '/^\s*USER:/d' "$COMPOSE_FILE"
+                sed -i '/^\s*PASS:/d' "$COMPOSE_FILE"
+                log_success "Password protection removed. Web viewer is now open."
+            fi
+            ;;
+        3)
+            # Remove the web port line
+            sed -i '/- [0-9]*:8006/d' "$COMPOSE_FILE"
+            # Also remove USER/PASS if they exist (no longer needed)
+            sed -i '/^\s*USER:/d' "$COMPOSE_FILE"
+            sed -i '/^\s*PASS:/d' "$COMPOSE_FILE"
+            log_success "Web viewer disabled. Use RDP to access the VM."
+            echo ""
+            log_info "You can still monitor installation via: winbox logs"
+            ;;
+        4|*)
+            log_info "No changes made."
+            return
+            ;;
+    esac
+    
+    prompt_restart_if_running
+}
+
+# Helper: Add VNC password protection
+add_vnc_password() {
+    # Get Windows credentials from config
+    local WIN_USER=$(grep -E '^\s+USERNAME:' "$COMPOSE_FILE" | sed 's/.*USERNAME: *"\?\([^"]*\)"\?.*/\1/' | tr -d ' ')
+    local WIN_PASS=$(grep -E '^\s+PASSWORD:' "$COMPOSE_FILE" | sed 's/.*PASSWORD: *"\?\([^"]*\)"\?.*/\1/' | tr -d ' ')
+    WIN_USER=${WIN_USER:-Docker}
+    WIN_PASS=${WIN_PASS:-admin}
+    
+    echo ""
+    echo "Web viewer credentials can match your Windows login for convenience."
+    echo "  Windows user: $WIN_USER"
+    echo ""
+    read -p "Use same credentials as Windows login? (Y/n): " USE_SAME
+    
+    local VNC_USER="$WIN_USER"
+    local VNC_PASS="$WIN_PASS"
+    
+    if [[ "$USE_SAME" =~ ^[nN] ]]; then
+        read -p "Enter web viewer username [Default: admin]: " VNC_USER
+        VNC_USER=${VNC_USER:-admin}
+        read -s -p "Enter web viewer password: " VNC_PASS
+        echo ""
+        if [ -z "$VNC_PASS" ]; then
+            log_error "Password cannot be empty."
+            return 1
+        fi
+    fi
+    
+    # Check if USER/PASS already exist and update, otherwise add
+    if grep -q '^\s*PASS:' "$COMPOSE_FILE"; then
+        # Update existing
+        sed -i "s/^\(\s*\)USER:.*/\1USER: \"$VNC_USER\"/" "$COMPOSE_FILE"
+        sed -i "s/^\(\s*\)PASS:.*/\1PASS: \"$VNC_PASS\"/" "$COMPOSE_FILE"
+    else
+        # Add after PASSWORD line (or after REGION if no PASSWORD)
+        if grep -q '^\s*PASSWORD:' "$COMPOSE_FILE"; then
+            sed -i "/^\s*PASSWORD:/a\\      USER: \"$VNC_USER\"\n      PASS: \"$VNC_PASS\"" "$COMPOSE_FILE"
+        elif grep -q '^\s*REGION:' "$COMPOSE_FILE"; then
+            sed -i "/^\s*REGION:/a\\      USER: \"$VNC_USER\"\n      PASS: \"$VNC_PASS\"" "$COMPOSE_FILE"
+        else
+            # Fallback: add after VERSION
+            sed -i "/^\s*VERSION:/a\\      USER: \"$VNC_USER\"\n      PASS: \"$VNC_PASS\"" "$COMPOSE_FILE"
+        fi
+    fi
+    
+    log_success "Password protection enabled for web viewer."
+    echo "  Username: $VNC_USER"
+}
+
+# Helper: Prompt to restart if VM is running
+prompt_restart_if_running() {
+    if is_container_running; then
+        echo ""
+        read -p "VM is running. Restart now to apply changes? (y/N): " RESTART_NOW
+        if [[ "$RESTART_NOW" =~ ^[yY] ]]; then
+            stop_vm
+            start_vm
+        else
+            log_info "Run '$0 restart' to apply changes."
+        fi
+    fi
+}
+
 # Show help
 show_help() {
     show_banner
@@ -1401,6 +1687,7 @@ show_help() {
     echo "  logs           Show container logs (Ctrl+C to exit)"
     echo "  config         Display current docker-compose.yml"
     echo "  edit           Modify VM settings (RAM, CPU, ports)"
+    echo "  secure         Configure web viewer security (password/disable)"
     echo "  update         Check for and pull latest dockurr/windows image"
     echo "  self-update    Update winbox script to the latest version"
     echo "  firewall       Show commands to open firewall ports for LAN access"
@@ -1445,6 +1732,9 @@ case "$1" in
         ;;
     self-update)
         self_update
+        ;;
+    secure)
+        secure_vm
         ;;
     version)
         echo "winbox version $WINBOX_VERSION"

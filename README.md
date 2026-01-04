@@ -54,6 +54,7 @@ chmod +x winbox
 | `logs` | Show container logs |
 | `config` | Display current docker-compose.yml |
 | `edit` | Modify VM settings (RAM, CPU, ports) |
+| `secure` | Manage web viewer security (password/disable) |
 | `update` | Pull latest dockur/windows image |
 | `self-update` | Update winbox script to the latest version |
 | `firewall` | Show commands to open ports for LAN access |
@@ -84,6 +85,27 @@ See all versions with `./winbox install`.
 - macOS: Microsoft Remote Desktop
 
 Default credentials: `Docker` / `admin`
+
+## Web Viewer Security
+
+The web viewer (port 8006) provides browser-based access to your VM but is **open by default** with no authentication. This is fine for local development but risky on public networks.
+
+**Options:**
+
+| Method | Security | Use Case |
+|--------|----------|----------|
+| No protection | None | Local/private networks only |
+| Password protection | HTTP Basic Auth | LAN access with trusted users |
+| Disabled | Full | Production, use RDP only |
+
+**Configure during setup:** The `install` wizard asks about web viewer security.
+
+**Configure after setup:** Use `./winbox secure` to:
+- Add or change password protection
+- Remove password protection
+- Disable/re-enable the web viewer entirely
+
+**Recommendation:** For any internet-exposed VM, either disable the web viewer or use password protection. RDP with strong credentials is the most secure option.
 
 ## Configuration
 
