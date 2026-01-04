@@ -285,7 +285,7 @@ cleanup_on_interrupt() {
 }
 
 # Version
-WINBOX_VERSION="1.0.0"
+WINBOX_VERSION="1.1.0"
 WINBOX_REPO="abhishekbhardwaj/winbox"
 WINBOX_RAW_URL="https://raw.githubusercontent.com/${WINBOX_REPO}/main/winbox"
 WINBOX_RELEASES_API="https://api.github.com/repos/${WINBOX_REPO}/releases/latest"

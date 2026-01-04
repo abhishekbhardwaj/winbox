@@ -12,7 +12,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WINBOX_FILE="$SCRIPT_DIR/winbox"
+WINBOX_FILE="$SCRIPT_DIR/../winbox"
 
 # Get current version
 CURRENT_VERSION=$(grep -E '^WINBOX_VERSION=' "$WINBOX_FILE" | head -1 | cut -d'"' -f2)
