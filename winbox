@@ -1,0 +1,1312 @@
+#!/bin/bash
+
+###############################################################################
+#                         WINDOWS DOCKER MANAGER
+###############################################################################
+#
+# DESCRIPTION:
+#   A comprehensive CLI tool for managing Windows virtual machines running
+#   inside Docker containers using the dockurr/windows image. This script
+#   simplifies the setup, configuration, and lifecycle management of Windows
+#   VMs with KVM acceleration.
+#
+# REQUIREMENTS:
+#   - Linux host (tested on Ubuntu 24.04) - macOS/Windows NOT supported
+#   - Docker (with docker compose v2)
+#   - KVM support enabled in BIOS (Intel VT-x or AMD-V)
+#   - User must be in 'kvm' group: sudo usermod -aG kvm $USER
+#
+# WHY LINUX ONLY?
+#   This script uses dockur/windows which runs QEMU+KVM inside a container.
+#   KVM is a Linux kernel feature that provides hardware virtualization.
+#   macOS and Windows don't have KVM, so this container cannot run there.
+#   For Windows VMs on macOS, use Parallels, VMware Fusion, or UTM instead.
+#
+# USAGE:
+#   ./windows-docker-manager <command>
+#
+# COMMANDS:
+#   install   - Interactive setup wizard to configure and optionally start a
+#               new Windows VM. Creates docker-compose.yml with your settings.
+#   start     - Start the configured Windows VM container
+#   stop      - Gracefully stop the Windows VM (2 minute grace period)
+#   restart   - Stop and then start the VM
+#   status    - Show current container status and resource usage
+#   logs      - Show container logs (useful for debugging)
+#   config    - Display the current docker-compose.yml configuration
+#   edit      - Modify VM settings (RAM, CPU, disk, ports, etc.)
+#   firewall  - Show commands to open firewall ports for LAN access
+#   update    - Check for and pull latest dockurr/windows image
+#   remove    - Remove the VM container and config (keeps data directory)
+#
+# CONFIGURATION FILES:
+#   ~/.winbox/docker-compose.yml  - Generated compose file
+#   ~/.winbox/data/               - VM storage (virtual disk, etc.)
+#   ~/.winbox/shared/             - Shared folder (if enabled)
+#   ~/.winbox/oem/                - Post-install scripts (if enabled)
+#
+# ENVIRONMENT VARIABLES (set in docker-compose.yml):
+#   VERSION     - Windows version to install (default: "11")
+#                 Values: 11, 11l (LTSC), 11e (Enterprise), 10, 10l, 10e,
+#                         8e, 7u, vu (Vista), xp, 2k,
+#                         2025, 2022, 2019, 2016, 2012, 2008, 2003 (Server)
+#   RAM_SIZE    - RAM allocation (default: "4G")
+#                 Examples: "4G", "8G", "16G"
+#   CPU_CORES   - Number of CPU cores (default: "2")
+#                 Note: Cores are shared with host, not dedicated
+#   DISK_SIZE   - Virtual disk size (default: "64G")
+#                 Can be increased later (requires manual partition extend)
+#   USERNAME    - Windows username (default: "Docker")
+#   PASSWORD    - Windows password (default: "admin")
+#   LANGUAGE    - Windows UI language (default: "English")
+#                 Options: Arabic, Bulgarian, Chinese, Croatian, Czech, Danish,
+#                 Dutch, English, Estonian, Finnish, French, German, Greek,
+#                 Hebrew, Hungarian, Italian, Japanese, Korean, Latvian,
+#                 Lithuanian, Norwegian, Polish, Portuguese, Romanian, Russian,
+#                 Serbian, Slovak, Slovenian, Spanish, Swedish, Thai, Turkish,
+#                 Ukrainian
+#   REGION      - Locale/region setting (default: matches language)
+#                 Example: "en-US", "de-DE", "fr-FR"
+#   KEYBOARD    - Keyboard layout (default: matches language)
+#                 Example: "en-US", "de-DE", "fr-FR"
+#   GPU         - Enable Intel iGPU passthrough (default: not set)
+#                 Set to "Y" to enable (requires /dev/dri device)
+#   MANUAL      - Manual installation mode (default: not set)
+#                 Set to "Y" to disable automatic installation
+#   DHCP        - Get IP from router via macvlan (default: not set)
+#                 Set to "Y" to enable (requires additional network setup)
+#
+# VOLUMES:
+#   /storage    - Primary storage for VM disk image
+#   /shared     - Shared folder accessible from Windows desktop as "Shared"
+#   /oem        - Post-install scripts (place install.bat here)
+#   /boot.iso   - Custom ISO file (overrides VERSION download)
+#
+# PORTS:
+#   8006        - Web-based VNC viewer (for installation monitoring)
+#   3389        - RDP (Remote Desktop Protocol) for normal usage
+#
+# ACCESSING THE VM:
+#   1. During installation: Open http://<server-ip>:8006 in browser
+#   2. After installation: Use any RDP client to connect to <server-ip>:3389
+#      - Windows: mstsc.exe
+#      - Linux: freerdp, remmina
+#      - macOS: Microsoft Remote Desktop
+#
+# INTEL iGPU PASSTHROUGH:
+#   If your system has an Intel CPU with integrated graphics, you can enable
+#   hardware acceleration for the VM. This is useful for video encoding,
+#   transcoding, and general graphics performance.
+#
+#   Requirements:
+#   - Intel CPU with integrated graphics (Intel HD, UHD, Iris, Arc)
+#   - /dev/dri device must exist on host
+#   - User must have access to /dev/dri (usually via 'render' or 'video' group)
+#
+#   To verify: ls -la /dev/dri/
+#
+# DISCRETE GPU PASSTHROUGH (Advanced - Manual Setup Required):
+#   For NVIDIA/AMD discrete GPU passthrough, this script does NOT automate the
+#   setup, but here's a working example from the community.
+#
+#   Prerequisites:
+#   1. IOMMU enabled in BIOS (Intel VT-d or AMD-Vi)
+#   2. IOMMU enabled in kernel: add to GRUB_CMDLINE_LINUX:
+#      - Intel: intel_iommu=on iommu=pt
+#      - AMD: amd_iommu=on iommu=pt
+#   3. GPU bound to vfio-pci driver (not nvidia/amdgpu)
+#   4. Find your IOMMU group: ls /dev/vfio/
+#   5. Find GPU PCI addresses: lspci -nn | grep -E "VGA|Audio"
+#
+#   Working example for AMD RX 570 (avoids Code 43 error):
+#   Source: https://github.com/dockur/windows/issues/22#issuecomment-3140386530
+#   The key trick is adding a PCIe root port for the GPU to plug into.
+#
+#   services:
+#     windows:
+#       image: dockurr/windows
+#       container_name: windows-vm
+#       privileged: true
+#       devices:
+#         - /dev/kvm
+#         - /dev/vfio/2              # Your IOMMU group number
+#       environment:
+#         VERSION: "10"
+#         CPU_CORES: "4"
+#         RAM_SIZE: "16G"
+#         DISK_SIZE: "128G"
+#         ARGUMENTS: >
+#           -device pcie-root-port,id=pcieport0,bus=pcie.0,chassis=1
+#           -device vfio-pci,host=01:00.0,bus=pcieport0,addr=00.0,multifunction=on
+#           -device vfio-pci,host=01:00.1,bus=pcieport0,addr=00.1
+#           -rtc base=localtime
+#       volumes:
+#         - ./data:/storage
+#       cap_add:
+#         - NET_ADMIN
+#       ports:
+#         - 8006:8006
+#         - 3389:3389/tcp
+#         - 3389:3389/udp
+#       stop_grace_period: 2m
+#
+#   Notes:
+#   - 01:00.0 = GPU, 01:00.1 = GPU Audio (pass both as multifunction)
+#   - Replace IOMMU group number (/dev/vfio/2) with yours
+#   - The pcie-root-port trick prevents Code 43 on many GPUs
+#   - NVIDIA GPUs may need additional args to hide VM from driver
+#   - This is EXCLUSIVE passthrough - host loses GPU access while VM runs
+#
+# EXAMPLES:
+#   # First-time setup
+#   ./windows-docker-manager install
+#
+#   # Start existing VM
+#   ./windows-docker-manager start
+#
+#   # Check if VM is running
+#   ./windows-docker-manager status
+#
+#   # View logs for troubleshooting
+#   ./windows-docker-manager logs
+#
+#   # Stop VM gracefully
+#   ./windows-docker-manager stop
+#
+# TROUBLESHOOTING:
+#   - "KVM not found": Enable virtualization in BIOS, install qemu-kvm
+#   - "Permission denied on /dev/kvm": Add user to kvm group, re-login
+#   - "Installation stuck": Check web UI at port 8006, may need more RAM
+#   - "RDP won't connect": Wait for installation to complete (~15-20 min)
+#   - "Black screen in browser": Try RDP instead after installation
+#
+# UPSTREAM PROJECT:
+#   https://github.com/dockur/windows
+#   Docker Hub: dockurr/windows
+#
+# LICENSE:
+#   MIT License
+#
+# AUTHOR:
+#   Management script for dockurr/windows Docker image
+#
+###############################################################################
+
+# =============================================================================
+# OS Check - This script only works on Linux (requires KVM)
+# =============================================================================
+check_os() {
+    case "$OSTYPE" in
+        linux*)
+            # All good, continue
+            ;;
+        darwin*)
+            echo ""
+            echo "ERROR: This script requires Linux with KVM support."
+            echo ""
+            echo "macOS does not support KVM (it's a Linux kernel feature)."
+            echo "The dockur/windows container requires KVM for hardware acceleration."
+            echo ""
+            echo "Alternatives for running Windows on macOS:"
+            echo "  - Parallels Desktop (best performance)"
+            echo "  - VMware Fusion"
+            echo "  - UTM (free, uses Apple Virtualization)"
+            echo "  - VirtualBox (free, slower)"
+            echo ""
+            echo "For running macOS in Docker on Linux, see: https://github.com/dockur/macos"
+            echo ""
+            exit 1
+            ;;
+        msys*|cygwin*|win32*)
+            echo ""
+            echo "ERROR: This script requires Linux with KVM support."
+            echo ""
+            echo "Windows does not support KVM (it's a Linux kernel feature)."
+            echo "The dockur/windows container requires KVM for hardware acceleration."
+            echo ""
+            echo "To run Windows VMs on Windows, use:"
+            echo "  - Hyper-V (built into Windows Pro/Enterprise)"
+            echo "  - VMware Workstation"
+            echo "  - VirtualBox (free)"
+            echo ""
+            exit 1
+            ;;
+        *)
+            echo ""
+            echo "ERROR: Unsupported operating system: $OSTYPE"
+            echo "This script requires Linux with KVM support."
+            echo ""
+            exit 1
+            ;;
+    esac
+}
+
+# Run OS check immediately
+check_os
+
+# Trap Ctrl+C for cleanup
+cleanup_on_interrupt() {
+    echo ""
+    log_warn "Installation cancelled by user."
+    # Remove partial config if it exists and is empty/incomplete
+    if [ -f "$COMPOSE_FILE" ]; then
+        if ! grep -q "stop_grace_period" "$COMPOSE_FILE" 2>/dev/null; then
+            rm -f "$COMPOSE_FILE"
+            log_info "Partial configuration removed."
+        fi
+    fi
+    exit 130
+}
+
+# Configuration
+WINBOX_DIR="$HOME/.winbox"
+COMPOSE_FILE="$WINBOX_DIR/docker-compose.yml"
+DATA_DIR="$WINBOX_DIR/data"
+SHARED_DIR="$WINBOX_DIR/shared"
+OEM_DIR="$WINBOX_DIR/oem"
+
+# ANSI Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# ASCII Art Banner
+show_banner() {
+    echo -e "${CYAN}"
+    echo '          _       __              '
+    echo '   _    _(_)___  / /_  ____  _  __'
+    echo '  | |/|/ / / _ \/ __ \/ __ \| |/_/'
+    echo '  |__,__/_/_//_/_/_/_/\____/>  <  '
+    echo '                         /_/|_|  '
+    echo -e "${NC}"
+}
+
+# Logging functions
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_header() { echo -e "\n${BOLD}${CYAN}=== $1 ===${NC}\n"; }
+
+# =============================================================================
+# Validation Functions
+# =============================================================================
+
+# Validate size format (e.g., 4G, 16G, 128G)
+validate_size() {
+    local size=$1
+    if [[ "$size" =~ ^[0-9]+[GgMm]$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Validate number within range
+validate_number() {
+    local num=$1
+    local min=$2
+    local max=$3
+    if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge "$min" ] && [ "$num" -le "$max" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Validate Windows version
+validate_version() {
+    local version=$1
+    local valid_versions="11 11l 11e 10 10l 10e 8e 7u vu xp 2k 2025 2022 2019 2016 2012 2008 2003"
+    for v in $valid_versions; do
+        if [ "$version" == "$v" ]; then
+            return 0
+        fi
+    done
+    # Also allow URLs for custom ISOs
+    if [[ "$version" =~ ^https?:// ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Validate port number
+validate_port() {
+    local port=$1
+    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Check available disk space (in GB)
+check_disk_space() {
+    local path=$1
+    local required_gb=$2
+    local available_gb=$(df -BG "$path" 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G')
+    if [ -n "$available_gb" ] && [ "$available_gb" -ge "$required_gb" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Check if container is running
+is_container_running() {
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^windows-vm$'
+}
+
+# Check if container exists (running or stopped)
+container_exists() {
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^windows-vm$'
+}
+
+# Check if a port is available
+# Returns 0 if available, 1 if in use
+check_port() {
+    local port=$1
+    if command -v ss &> /dev/null; then
+        ss -tuln 2>/dev/null | grep -q ":${port} " && return 1
+    elif command -v netstat &> /dev/null; then
+        netstat -tuln 2>/dev/null | grep -q ":${port} " && return 1
+    else
+        # Fallback: try to bind to the port
+        (echo >/dev/tcp/localhost/$port) 2>/dev/null && return 1
+    fi
+    return 0
+}
+
+# Get process using a port
+get_port_process() {
+    local port=$1
+    if command -v ss &> /dev/null; then
+        ss -tulnp 2>/dev/null | grep ":${port} " | awk '{print $NF}' | head -1
+    elif command -v netstat &> /dev/null; then
+        netstat -tulnp 2>/dev/null | grep ":${port} " | awk '{print $NF}' | head -1
+    else
+        echo "unknown"
+    fi
+}
+
+# Check if required ports are available
+check_ports() {
+    local web_port=$1
+    local rdp_port=$2
+    local has_error=0
+
+    log_info "Checking port availability..."
+
+    if ! check_port "$web_port"; then
+        local process=$(get_port_process "$web_port")
+        log_error "Port $web_port (Web Viewer) is already in use"
+        echo "  Process: $process"
+        has_error=1
+    fi
+
+    if ! check_port "$rdp_port"; then
+        local process=$(get_port_process "$rdp_port")
+        log_error "Port $rdp_port (RDP) is already in use"
+        echo "  Process: $process"
+        has_error=1
+    fi
+
+    if [ $has_error -eq 1 ]; then
+        echo ""
+        echo "Please either:"
+        echo "  1. Stop the service using these ports"
+        echo "  2. Choose different ports during setup"
+        echo ""
+        return 1
+    fi
+
+    log_success "Ports $web_port and $rdp_port are available"
+    return 0
+}
+
+# Check system dependencies
+check_system_deps() {
+    local has_error=0
+
+    if ! command -v docker &> /dev/null; then
+        log_error "Docker is not installed."
+        echo "Please install Docker: https://docs.docker.com/engine/install/ubuntu/"
+        has_error=1
+    fi
+
+    if ! docker compose version &> /dev/null; then
+        log_error "Docker Compose (v2) is not available."
+        echo "Please ensure Docker Compose plugin is installed."
+        has_error=1
+    fi
+
+    if [ ! -e /dev/kvm ]; then
+        log_error "KVM virtualization support not found (/dev/kvm missing)."
+        echo "Please ensure:"
+        echo "  1. Virtualization is enabled in BIOS (Intel VT-x or AMD-V)"
+        echo "  2. KVM modules are loaded: sudo modprobe kvm && sudo modprobe kvm_intel"
+        echo "  3. Install qemu-kvm: sudo apt install qemu-kvm"
+        has_error=1
+    fi
+
+    if [ -e /dev/kvm ] && [ ! -r /dev/kvm ]; then
+        log_error "No permission to access /dev/kvm"
+        echo "Add your user to the kvm group: sudo usermod -aG kvm $USER"
+        echo "Then log out and back in."
+        has_error=1
+    fi
+
+    if [ $has_error -eq 1 ]; then
+        exit 1
+    fi
+
+    log_success "System dependencies verified"
+}
+
+# Display Windows version options
+show_version_options() {
+    echo "Available Windows versions:"
+    echo ""
+    echo -e "  ${BOLD}Desktop:${NC}"
+    echo "    11   - Windows 11 Pro (7.2 GB)"
+    echo "    11l  - Windows 11 LTSC (4.7 GB)"
+    echo "    11e  - Windows 11 Enterprise (6.6 GB)"
+    echo "    10   - Windows 10 Pro (5.7 GB)"
+    echo "    10l  - Windows 10 LTSC (4.6 GB)"
+    echo "    10e  - Windows 10 Enterprise (5.2 GB)"
+    echo "    8e   - Windows 8.1 Enterprise (3.7 GB)"
+    echo "    7u   - Windows 7 Ultimate (3.1 GB)"
+    echo "    vu   - Windows Vista Ultimate (3.0 GB)"
+    echo "    xp   - Windows XP Professional (0.6 GB)"
+    echo "    2k   - Windows 2000 Professional (0.4 GB)"
+    echo ""
+    echo -e "  ${BOLD}Server:${NC}"
+    echo "    2025 - Windows Server 2025 (6.7 GB)"
+    echo "    2022 - Windows Server 2022 (6.0 GB)"
+    echo "    2019 - Windows Server 2019 (5.3 GB)"
+    echo "    2016 - Windows Server 2016 (6.5 GB)"
+    echo "    2012 - Windows Server 2012 (4.3 GB)"
+    echo "    2008 - Windows Server 2008 (3.0 GB)"
+    echo "    2003 - Windows Server 2003 (0.6 GB)"
+    echo ""
+}
+
+# Display language options
+show_language_options() {
+    echo "Available languages:"
+    echo "  Arabic, Bulgarian, Chinese, Croatian, Czech, Danish, Dutch, English,"
+    echo "  Estonian, Finnish, French, German, Greek, Hebrew, Hungarian, Italian,"
+    echo "  Japanese, Korean, Latvian, Lithuanian, Norwegian, Polish, Portuguese,"
+    echo "  Romanian, Russian, Serbian, Slovak, Slovenian, Spanish, Swedish, Thai,"
+    echo "  Turkish, Ukrainian"
+    echo ""
+}
+
+# Install Windows VM
+install_windows() {
+    # Set up Ctrl+C trap
+    trap cleanup_on_interrupt INT
+
+    check_system_deps
+
+    # Check if config already exists
+    if [ -f "$COMPOSE_FILE" ]; then
+        echo ""
+        log_warn "A Windows VM configuration already exists!"
+        echo "Location: $COMPOSE_FILE"
+        echo ""
+        if is_container_running; then
+            log_error "The VM is currently running. Stop it first with: $0 stop"
+            exit 1
+        fi
+        read -p "Overwrite existing configuration? (y/N): " OVERWRITE
+        if [[ ! "$OVERWRITE" =~ ^[yY] ]]; then
+            log_info "Installation cancelled. Use '$0 edit' to modify existing config."
+            exit 0
+        fi
+        echo ""
+    fi
+
+    mkdir -p "$WINBOX_DIR"
+    mkdir -p "$DATA_DIR"
+
+    # Check disk space (need at least 20GB for ISO + VM disk)
+    if ! check_disk_space "$DATA_DIR" 20; then
+        log_warn "Low disk space detected in $DATA_DIR"
+        echo "Windows installation requires at least 20GB free (ISO download + VM disk)."
+        read -p "Continue anyway? (y/N): " CONTINUE_LOW_SPACE
+        if [[ ! "$CONTINUE_LOW_SPACE" =~ ^[yY] ]]; then
+            exit 1
+        fi
+    fi
+
+    echo ""
+    show_banner
+    echo -e "${BOLD}Interactive Setup${NC}"
+    echo ""
+
+    # --- Windows Version ---
+    log_header "Windows Version"
+    show_version_options
+    while true; do
+        read -p "Enter version code [Default: 11]: " WIN_VERSION
+        WIN_VERSION=${WIN_VERSION:-11}
+        if validate_version "$WIN_VERSION"; then
+            break
+        else
+            log_error "Invalid version. Please enter a valid code from the list above."
+        fi
+    done
+
+    # --- Resources ---
+    log_header "Resource Allocation"
+    
+    # RAM
+    TOTAL_RAM_GB=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
+    echo "Total System RAM: ${TOTAL_RAM_GB} GB"
+    while true; do
+        read -p "Enter RAM for Windows (e.g., 4G, 8G, 16G) [Default: 4G]: " RAM_SIZE
+        RAM_SIZE=${RAM_SIZE:-4G}
+        # Normalize to uppercase
+        RAM_SIZE=$(echo "$RAM_SIZE" | tr '[:lower:]' '[:upper:]')
+        if validate_size "$RAM_SIZE"; then
+            break
+        else
+            log_error "Invalid format. Use format like: 4G, 8G, 16G"
+        fi
+    done
+
+    # CPU
+    TOTAL_CORES=$(nproc)
+    echo "Total CPU Cores/Threads: $TOTAL_CORES"
+    log_info "Note: CPU cores are shared with host (not dedicated)"
+    while true; do
+        read -p "Enter CPU cores (1-$TOTAL_CORES) [Default: 2]: " CPU_CORES
+        CPU_CORES=${CPU_CORES:-2}
+        if validate_number "$CPU_CORES" 1 "$TOTAL_CORES"; then
+            break
+        else
+            log_error "Please enter a number between 1 and $TOTAL_CORES"
+        fi
+    done
+
+    # Disk
+    while true; do
+        read -p "Enter Disk Size (e.g., 64G, 128G, 256G) [Default: 64G]: " DISK_SIZE
+        DISK_SIZE=${DISK_SIZE:-64G}
+        # Normalize to uppercase
+        DISK_SIZE=$(echo "$DISK_SIZE" | tr '[:lower:]' '[:upper:]')
+        if validate_size "$DISK_SIZE"; then
+            break
+        else
+            log_error "Invalid format. Use format like: 64G, 128G, 256G"
+        fi
+    done
+
+    # --- Network ---
+    log_header "Network Configuration"
+    echo "Port 8006: Web-based viewer (for installation monitoring)"
+    echo "Port 3389: RDP (for normal usage after installation)"
+    
+    # RDP Port with validation
+    while true; do
+        read -p "Enter external RDP port [Default: 3389]: " RDP_PORT
+        RDP_PORT=${RDP_PORT:-3389}
+        if validate_port "$RDP_PORT"; then
+            break
+        else
+            log_error "Invalid port. Please enter a number between 1 and 65535"
+        fi
+    done
+
+    # Web viewer port with validation
+    while true; do
+        read -p "Enter external Web viewer port [Default: 8006]: " WEB_PORT
+        WEB_PORT=${WEB_PORT:-8006}
+        if validate_port "$WEB_PORT"; then
+            if [ "$WEB_PORT" == "$RDP_PORT" ]; then
+                log_error "Web port cannot be the same as RDP port"
+            else
+                break
+            fi
+        else
+            log_error "Invalid port. Please enter a number between 1 and 65535"
+        fi
+    done
+
+    # Check if ports are available
+    while ! check_ports "$WEB_PORT" "$RDP_PORT"; do
+        echo ""
+        log_warn "Please choose different ports:"
+        while true; do
+            read -p "Enter external RDP port [Default: 3389]: " RDP_PORT
+            RDP_PORT=${RDP_PORT:-3389}
+            if validate_port "$RDP_PORT"; then break; fi
+            log_error "Invalid port number"
+        done
+        while true; do
+            read -p "Enter external Web viewer port [Default: 8006]: " WEB_PORT
+            WEB_PORT=${WEB_PORT:-8006}
+            if validate_port "$WEB_PORT" && [ "$WEB_PORT" != "$RDP_PORT" ]; then break; fi
+            log_error "Invalid port or same as RDP port"
+        done
+    done
+
+    # --- Intel iGPU Passthrough ---
+    log_header "Intel iGPU Passthrough"
+    
+    GPU_ENV=""
+    GPU_DEVICE=""
+    
+    if [ -d /dev/dri ]; then
+        echo "Intel iGPU detected (/dev/dri exists)"
+        echo ""
+        echo "Enabling iGPU passthrough gives Windows access to Intel graphics for:"
+        echo "  - Hardware video encoding/decoding (Quick Sync)"
+        echo "  - Better graphics performance"
+        echo "  - GPU-accelerated applications"
+        echo ""
+        echo "Note: This is shared access, not exclusive (host keeps GPU too)."
+        read -p "Enable Intel iGPU passthrough? (y/N): " ENABLE_IGPU
+        
+        if [[ "$ENABLE_IGPU" =~ ^[yY] ]]; then
+            GPU_ENV="GPU: \"Y\""
+            GPU_DEVICE="- /dev/dri"
+            log_success "Intel iGPU passthrough enabled"
+        fi
+    else
+        log_info "No Intel iGPU detected (/dev/dri not found). Skipping GPU passthrough."
+    fi
+
+    # --- Language & Region ---
+    log_header "Language & Region"
+    show_language_options
+    read -p "Enter language [Default: English]: " LANGUAGE
+    LANGUAGE=${LANGUAGE:-English}
+
+    read -p "Enter keyboard layout (e.g., en-US, de-DE) [Default: en-US]: " KEYBOARD
+    KEYBOARD=${KEYBOARD:-en-US}
+
+    read -p "Enter region (e.g., en-US, de-DE) [Default: en-US]: " REGION
+    REGION=${REGION:-en-US}
+
+    # --- Credentials ---
+    log_header "Windows Credentials"
+    read -p "Enter Username [Default: Docker]: " WIN_USER
+    WIN_USER=${WIN_USER:-Docker}
+    
+    read -s -p "Enter Password [Default: admin]: " WIN_PASS
+    echo ""
+    WIN_PASS=${WIN_PASS:-admin}
+
+    # --- Shared Folder ---
+    log_header "Shared Folder"
+    echo "Create a folder that's accessible from both Linux host and Windows VM."
+    echo ""
+    echo "How it works:"
+    echo "  - Files you put in the host folder appear in Windows"
+    echo "  - Files saved in Windows appear on the host"
+    echo "  - Shows up as 'Shared' folder on the Windows desktop"
+    echo ""
+    echo "Great for transferring files without using RDP copy/paste."
+    read -p "Enable shared folder? (y/N): " ENABLE_SHARED
+    
+    SHARED_VOLUME=""
+    if [[ "$ENABLE_SHARED" =~ ^[yY] ]]; then
+        mkdir -p "$SHARED_DIR"
+        read -p "Enter shared folder path [Default: $SHARED_DIR]: " CUSTOM_SHARED
+        SHARED_DIR=${CUSTOM_SHARED:-$SHARED_DIR}
+        mkdir -p "$SHARED_DIR"
+        SHARED_VOLUME="- $SHARED_DIR:/shared"
+        log_success "Shared folder enabled: $SHARED_DIR"
+    fi
+
+    # --- Post-Install Scripts ---
+    log_header "Post-Install Scripts (OEM)"
+    echo "Run custom scripts automatically after Windows installation completes."
+    echo ""
+    echo "How it works:"
+    echo "  1. Create a file named 'install.bat' in your OEM folder"
+    echo "  2. Add any software installers or files you need"
+    echo "  3. The folder becomes C:\\OEM in Windows and install.bat runs automatically"
+    echo ""
+    echo "Use this to pre-install software, configure settings, etc."
+    read -p "Enable post-install script support? (y/N): " ENABLE_OEM
+    
+    OEM_VOLUME=""
+    if [[ "$ENABLE_OEM" =~ ^[yY] ]]; then
+        mkdir -p "$OEM_DIR"
+        read -p "Enter OEM folder path [Default: $OEM_DIR]: " CUSTOM_OEM
+        OEM_DIR=${CUSTOM_OEM:-$OEM_DIR}
+        mkdir -p "$OEM_DIR"
+        OEM_VOLUME="- $OEM_DIR:/oem"
+        log_success "OEM folder enabled: $OEM_DIR"
+        log_info "Place your install.bat script in this folder before starting the VM"
+    fi
+
+    # --- Manual Installation ---
+    log_header "Installation Mode"
+    echo "Automatic mode (default): Windows installs unattended with optimized VM settings."
+    echo "Manual mode: You control the entire installation process yourself."
+    echo ""
+    echo "Choose manual if you need custom partitioning or have a special ISO."
+    read -p "Use manual installation instead? (y/N): " MANUAL_INSTALL
+    
+    MANUAL_ENV=""
+    if [[ "$MANUAL_INSTALL" =~ ^[yY] ]]; then
+        MANUAL_ENV="MANUAL: \"Y\""
+        log_warn "Manual installation enabled. You will need to configure Windows yourself."
+    fi
+
+    # --- Privileged Mode ---
+    log_header "Container Mode"
+    echo "Privileged mode gives the container full access to host devices."
+    echo ""
+    echo "When to enable:"
+    echo "  - You get 'permission denied' errors on /dev/kvm"
+    echo "  - You're doing advanced GPU passthrough (VFIO)"
+    echo "  - Troubleshooting device access issues"
+    echo ""
+    echo "Leave disabled for normal use (more secure)."
+    read -p "Run container in privileged mode? (y/N): " PRIVILEGED_MODE
+    
+    PRIVILEGED_LINE=""
+    if [[ "$PRIVILEGED_MODE" =~ ^[yY] ]]; then
+        PRIVILEGED_LINE="privileged: true"
+        log_warn "Privileged mode enabled"
+    fi
+
+    # --- Generate Compose File ---
+    log_header "Generating Configuration"
+
+    # Build environment section
+    ENV_SECTION="    environment:
+      VERSION: \"$WIN_VERSION\"
+      RAM_SIZE: \"$RAM_SIZE\"
+      CPU_CORES: \"$CPU_CORES\"
+      DISK_SIZE: \"$DISK_SIZE\"
+      USERNAME: \"$WIN_USER\"
+      PASSWORD: \"$WIN_PASS\"
+      LANGUAGE: \"$LANGUAGE\"
+      KEYBOARD: \"$KEYBOARD\"
+      REGION: \"$REGION\""
+
+    # Add optional environment variables
+    [ -n "$GPU_ENV" ] && ENV_SECTION="$ENV_SECTION
+      $GPU_ENV"
+    [ -n "$MANUAL_ENV" ] && ENV_SECTION="$ENV_SECTION
+      $MANUAL_ENV"
+
+    # Build devices section
+    DEVICES_SECTION="    devices:
+      - /dev/kvm
+      - /dev/net/tun"
+    [ -n "$GPU_DEVICE" ] && DEVICES_SECTION="$DEVICES_SECTION
+      $GPU_DEVICE"
+
+    # Build volumes section
+    VOLUMES_SECTION="    volumes:
+      - $DATA_DIR:/storage"
+    [ -n "$SHARED_VOLUME" ] && VOLUMES_SECTION="$VOLUMES_SECTION
+      $SHARED_VOLUME"
+    [ -n "$OEM_VOLUME" ] && VOLUMES_SECTION="$VOLUMES_SECTION
+      $OEM_VOLUME"
+
+    # Generate compose file
+    cat > "$COMPOSE_FILE" << EOF
+# Windows VM Docker Compose Configuration
+# Generated by windows-docker-manager
+# Upstream: https://github.com/dockur/windows
+
+services:
+  windows:
+    image: dockurr/windows
+    container_name: windows-vm
+$ENV_SECTION
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - ${WEB_PORT}:8006
+      - ${RDP_PORT}:3389/tcp
+      - ${RDP_PORT}:3389/udp
+$VOLUMES_SECTION
+$DEVICES_SECTION
+    restart: unless-stopped
+    stop_grace_period: 2m
+EOF
+
+    # Add privileged mode if enabled (needs to be after image line)
+    if [ -n "$PRIVILEGED_LINE" ]; then
+        sed -i '/container_name: windows-vm/a\    privileged: true' "$COMPOSE_FILE"
+    fi
+
+    log_success "Configuration saved to $COMPOSE_FILE"
+    
+    # --- Summary ---
+    log_header "Configuration Summary"
+    echo "  Windows Version:  $WIN_VERSION"
+    echo "  RAM:              $RAM_SIZE"
+    echo "  CPU Cores:        $CPU_CORES"
+    echo "  Disk Size:        $DISK_SIZE"
+    echo "  Username:         $WIN_USER"
+    echo "  Language:         $LANGUAGE"
+    echo "  Web Viewer Port:  $WEB_PORT"
+    echo "  RDP Port:         $RDP_PORT"
+    echo "  Intel iGPU:       $([ -n "$GPU_ENV" ] && echo "Enabled" || echo "Disabled")"
+    echo "  Shared Folder:    $([ -n "$SHARED_VOLUME" ] && echo "$SHARED_DIR" || echo "Disabled")"
+    echo "  OEM Scripts:      $([ -n "$OEM_VOLUME" ] && echo "$OEM_DIR" || echo "Disabled")"
+    echo "  Storage:          $DATA_DIR"
+    echo ""
+    
+    read -p "Start the VM now? (Y/n): " START_NOW
+    if [[ ! "$START_NOW" =~ ^[nN] ]]; then
+        start_vm
+    else
+        echo ""
+        log_info "Run '$0 start' when ready to launch the VM"
+    fi
+}
+
+# Start VM
+start_vm() {
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        log_error "No configuration found. Run '$0 install' first."
+        exit 1
+    fi
+
+    # Check if already running
+    if is_container_running; then
+        log_warn "Windows VM is already running!"
+        echo ""
+        # Show connection info
+        show_connection_info
+        exit 0
+    fi
+
+    # Parse ports from compose file first
+    local WEB_PORT=$(grep -E '^\s+-\s+[0-9]+:8006' "$COMPOSE_FILE" | head -1 | sed 's/.*- \([0-9]*\):8006.*/\1/')
+    local RDP_PORT=$(grep -E '^\s+-\s+[0-9]+:3389' "$COMPOSE_FILE" | head -1 | sed 's/.*- \([0-9]*\):3389.*/\1/')
+    WEB_PORT=${WEB_PORT:-8006}
+    RDP_PORT=${RDP_PORT:-3389}
+
+    # Check if ports are available before starting
+    if ! check_ports "$WEB_PORT" "$RDP_PORT"; then
+        log_error "Cannot start VM - ports are in use"
+        echo "Either free up the ports or run '$0 edit' to change ports."
+        exit 1
+    fi
+
+    # Check if image exists locally, if not pull it
+    if ! docker images --format '{{.Repository}}' | grep -q '^dockurr/windows$'; then
+        log_info "Pulling dockurr/windows image (this may take a while on first run)..."
+        docker pull dockurr/windows
+        echo ""
+    fi
+
+    log_info "Starting Windows VM..."
+    docker compose -f "$COMPOSE_FILE" up -d
+
+    if [ $? -eq 0 ]; then
+        log_success "Windows VM started!"
+        echo ""
+        show_connection_info
+    else
+        log_error "Failed to start VM. Check '$0 logs' for details."
+    fi
+}
+
+# Show connection information
+show_connection_info() {
+    # Parse from compose file
+    local WEB_PORT=$(grep -E '^\s+-\s+[0-9]+:8006' "$COMPOSE_FILE" | head -1 | sed 's/.*- \([0-9]*\):8006.*/\1/')
+    local RDP_PORT=$(grep -E '^\s+-\s+[0-9]+:3389' "$COMPOSE_FILE" | head -1 | sed 's/.*- \([0-9]*\):3389.*/\1/')
+    local USERNAME=$(grep -E '^\s+USERNAME:' "$COMPOSE_FILE" | sed 's/.*USERNAME: *"\?\([^"]*\)"\?.*/\1/' | tr -d ' ')
+    local PASSWORD=$(grep -E '^\s+PASSWORD:' "$COMPOSE_FILE" | sed 's/.*PASSWORD: *"\?\([^"]*\)"\?.*/\1/' | tr -d ' ')
+    
+    WEB_PORT=${WEB_PORT:-8006}
+    RDP_PORT=${RDP_PORT:-3389}
+    USERNAME=${USERNAME:-Docker}
+    PASSWORD=${PASSWORD:-admin}
+
+    # Try to get server IP
+    local SERVER_IP=$(hostname -I | awk '{print $1}')
+    SERVER_IP=${SERVER_IP:-<SERVER-IP>}
+
+    echo "┌──────────────────────────────────────────────────────────────────┐"
+    echo "│                      CONNECTION DETAILS                          │"
+    echo "├──────────────────────────────────────────────────────────────────┤"
+    echo "│                                                                  │"
+    echo -e "│  ${BOLD}During Installation (temporary):${NC}                             │"
+    echo "│    Web Viewer: http://${SERVER_IP}:${WEB_PORT}"
+    echo "│    (Low quality, no audio - just for monitoring install)        │"
+    echo "│                                                                  │"
+    echo -e "│  ${BOLD}After Installation (recommended):${NC}                            │"
+    echo "│    RDP: ${SERVER_IP}:${RDP_PORT}"
+    echo "│    (Full quality, audio, clipboard, better performance)         │"
+    echo "│                                                                  │"
+    echo "│  Credentials: ${USERNAME} / ${PASSWORD}"
+    echo "│                                                                  │"
+    echo "└──────────────────────────────────────────────────────────────────┘"
+    echo ""
+    log_info "Installation takes 10-20 minutes. Monitor progress via Web Viewer."
+    echo ""
+    echo -e "${BOLD}RDP Clients:${NC}"
+    echo "  Windows: mstsc (built-in, press Win+R, type 'mstsc')"
+    echo "  Linux:   remmina, freerdp (xfreerdp /v:${SERVER_IP}:${RDP_PORT})"
+    echo "  macOS:   Microsoft Remote Desktop (App Store)"
+}
+
+# Update/pull latest image
+update_image() {
+    log_info "Checking for updates to dockurr/windows image..."
+    echo ""
+    
+    # Get current image ID
+    local current_id=$(docker images --format '{{.ID}}' dockurr/windows 2>/dev/null | head -1)
+    
+    # Pull latest
+    docker pull dockurr/windows
+    
+    # Get new image ID
+    local new_id=$(docker images --format '{{.ID}}' dockurr/windows 2>/dev/null | head -1)
+    
+    echo ""
+    if [ "$current_id" != "$new_id" ] && [ -n "$current_id" ]; then
+        log_success "Image updated! New version pulled."
+        if is_container_running; then
+            log_warn "VM is currently running. Restart it to use the new image:"
+            echo "  $0 restart"
+        fi
+    else
+        log_success "Already running the latest version."
+    fi
+}
+
+# Edit VM configuration
+edit_vm() {
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        log_error "No configuration found. Run '$0 install' first."
+        exit 1
+    fi
+
+    # Check if running
+    local was_running=false
+    if is_container_running; then
+        was_running=true
+        log_warn "VM is currently running. Changes will take effect after restart."
+    fi
+
+    log_header "Edit VM Configuration"
+    echo "Select what to modify:"
+    echo ""
+    echo "  1) RAM size"
+    echo "  2) CPU cores"
+    echo "  3) RDP port"
+    echo "  4) Web viewer port"
+    echo "  5) View current config"
+    echo "  6) Cancel"
+    echo ""
+    read -p "Enter choice [1-6]: " EDIT_CHOICE
+
+    case "$EDIT_CHOICE" in
+        1)
+            local current=$(grep -E '^\s+RAM_SIZE:' "$COMPOSE_FILE" | sed 's/.*RAM_SIZE: *"\?\([^"]*\)"\?.*/\1/')
+            echo "Current RAM: ${current:-4G}"
+            while true; do
+                read -p "Enter new RAM size (e.g., 4G, 8G, 16G): " NEW_RAM
+                NEW_RAM=$(echo "$NEW_RAM" | tr '[:lower:]' '[:upper:]')
+                if validate_size "$NEW_RAM"; then
+                    sed -i "s/RAM_SIZE: *\"[^\"]*\"/RAM_SIZE: \"$NEW_RAM\"/" "$COMPOSE_FILE"
+                    log_success "RAM updated to $NEW_RAM"
+                    break
+                else
+                    log_error "Invalid format. Use format like: 4G, 8G, 16G"
+                fi
+            done
+            ;;
+        2)
+            local current=$(grep -E '^\s+CPU_CORES:' "$COMPOSE_FILE" | sed 's/.*CPU_CORES: *"\?\([^"]*\)"\?.*/\1/')
+            local max_cores=$(nproc)
+            echo "Current CPU cores: ${current:-2} (max: $max_cores)"
+            while true; do
+                read -p "Enter new CPU cores (1-$max_cores): " NEW_CPU
+                if validate_number "$NEW_CPU" 1 "$max_cores"; then
+                    sed -i "s/CPU_CORES: *\"[^\"]*\"/CPU_CORES: \"$NEW_CPU\"/" "$COMPOSE_FILE"
+                    log_success "CPU cores updated to $NEW_CPU"
+                    break
+                else
+                    log_error "Please enter a number between 1 and $max_cores"
+                fi
+            done
+            ;;
+        3)
+            local current=$(grep -E '^\s+-\s+[0-9]+:3389' "$COMPOSE_FILE" | head -1 | sed 's/.*- \([0-9]*\):3389.*/\1/')
+            echo "Current RDP port: ${current:-3389}"
+            while true; do
+                read -p "Enter new RDP port: " NEW_RDP
+                if validate_port "$NEW_RDP"; then
+                    if ! $was_running && ! check_port "$NEW_RDP"; then
+                        log_error "Port $NEW_RDP is already in use"
+                        continue
+                    fi
+                    sed -i "s/- ${current:-3389}:3389/- ${NEW_RDP}:3389/g" "$COMPOSE_FILE"
+                    log_success "RDP port updated to $NEW_RDP"
+                    break
+                else
+                    log_error "Invalid port number"
+                fi
+            done
+            ;;
+        4)
+            local current=$(grep -E '^\s+-\s+[0-9]+:8006' "$COMPOSE_FILE" | head -1 | sed 's/.*- \([0-9]*\):8006.*/\1/')
+            echo "Current Web viewer port: ${current:-8006}"
+            while true; do
+                read -p "Enter new Web viewer port: " NEW_WEB
+                if validate_port "$NEW_WEB"; then
+                    if ! $was_running && ! check_port "$NEW_WEB"; then
+                        log_error "Port $NEW_WEB is already in use"
+                        continue
+                    fi
+                    sed -i "s/- ${current:-8006}:8006/- ${NEW_WEB}:8006/" "$COMPOSE_FILE"
+                    log_success "Web viewer port updated to $NEW_WEB"
+                    break
+                else
+                    log_error "Invalid port number"
+                fi
+            done
+            ;;
+        5)
+            show_config
+            ;;
+        6|*)
+            log_info "No changes made."
+            return
+            ;;
+    esac
+
+    if $was_running; then
+        echo ""
+        read -p "Restart VM now to apply changes? (y/N): " RESTART_NOW
+        if [[ "$RESTART_NOW" =~ ^[yY] ]]; then
+            stop_vm
+            start_vm
+        else
+            log_info "Run '$0 restart' to apply changes."
+        fi
+    fi
+}
+
+# Stop VM
+stop_vm() {
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        log_error "No configuration found."
+        exit 1
+    fi
+    log_info "Stopping Windows VM (graceful shutdown, up to 2 minutes)..."
+    docker compose -f "$COMPOSE_FILE" down
+    log_success "VM Stopped."
+}
+
+# VM Status
+status_vm() {
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        echo "Not configured. Run '$0 install' to set up a Windows VM."
+        exit 0
+    fi
+    echo ""
+    log_header "Container Status"
+    docker compose -f "$COMPOSE_FILE" ps
+    echo ""
+    
+    # Show resource usage and connection info if running
+    if is_container_running; then
+        log_header "Resource Usage"
+        docker stats windows-vm --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}"
+        echo ""
+        show_connection_info
+    else
+        log_info "VM is not running. Use '$0 start' to start it."
+    fi
+}
+
+# Show logs
+show_logs() {
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        log_error "No configuration found."
+        exit 1
+    fi
+    docker compose -f "$COMPOSE_FILE" logs -f
+}
+
+# Show config
+show_config() {
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        log_error "No configuration found."
+        exit 1
+    fi
+    log_header "Current Configuration"
+    cat "$COMPOSE_FILE"
+}
+
+# Remove VM
+remove_vm() {
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        log_warn "No configuration found to remove."
+        exit 0
+    fi
+
+    echo ""
+    log_warn "This will remove the VM container and configuration."
+    echo "Data directory will be preserved: $DATA_DIR"
+    echo ""
+    read -p "Are you sure? (y/N): " CONFIRM
+    
+    if [[ "$CONFIRM" =~ ^[yY] ]]; then
+        log_info "Stopping container..."
+        docker compose -f "$COMPOSE_FILE" down 2>/dev/null
+        
+        rm "$COMPOSE_FILE"
+        log_success "VM configuration removed."
+        echo ""
+        echo "The following directories were NOT removed (contain your data):"
+        [ -d "$DATA_DIR" ] && echo "  - $DATA_DIR (VM storage)"
+        [ -d "$SHARED_DIR" ] && echo "  - $SHARED_DIR (shared folder)"
+        [ -d "$OEM_DIR" ] && echo "  - $OEM_DIR (OEM scripts)"
+        echo ""
+        echo "To completely remove all data, manually delete these directories."
+    else
+        log_info "Cancelled."
+    fi
+}
+
+# Show firewall help
+show_firewall() {
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        log_error "No configuration found. Run '$0 install' first."
+        exit 1
+    fi
+
+    # Parse ports from compose file
+    local WEB_PORT=$(grep -E '^\s+-\s+[0-9]+:8006' "$COMPOSE_FILE" | head -1 | sed 's/.*- \([0-9]*\):8006.*/\1/')
+    local RDP_PORT=$(grep -E '^\s+-\s+[0-9]+:3389' "$COMPOSE_FILE" | head -1 | sed 's/.*- \([0-9]*\):3389.*/\1/')
+    WEB_PORT=${WEB_PORT:-8006}
+    RDP_PORT=${RDP_PORT:-3389}
+
+    log_header "Firewall Configuration"
+    
+    echo "To access the Windows VM from other devices on your network,"
+    echo "you may need to open the following ports in your firewall:"
+    echo ""
+    echo "  - Port ${WEB_PORT}/tcp (Web Viewer)"
+    echo "  - Port ${RDP_PORT}/tcp (RDP)"
+    echo "  - Port ${RDP_PORT}/udp (RDP)"
+    echo ""
+    
+    echo -e "${BOLD}UFW (Ubuntu/Debian):${NC}"
+    echo "  sudo ufw allow ${WEB_PORT}/tcp comment 'Windows VM Web Viewer'"
+    echo "  sudo ufw allow ${RDP_PORT}/tcp comment 'Windows VM RDP'"
+    echo "  sudo ufw allow ${RDP_PORT}/udp comment 'Windows VM RDP'"
+    echo ""
+    
+    echo -e "${BOLD}firewalld (Fedora/RHEL/CentOS):${NC}"
+    echo "  sudo firewall-cmd --permanent --add-port=${WEB_PORT}/tcp"
+    echo "  sudo firewall-cmd --permanent --add-port=${RDP_PORT}/tcp"
+    echo "  sudo firewall-cmd --permanent --add-port=${RDP_PORT}/udp"
+    echo "  sudo firewall-cmd --reload"
+    echo ""
+    
+    echo -e "${BOLD}iptables (manual):${NC}"
+    echo "  sudo iptables -A INPUT -p tcp --dport ${WEB_PORT} -j ACCEPT"
+    echo "  sudo iptables -A INPUT -p tcp --dport ${RDP_PORT} -j ACCEPT"
+    echo "  sudo iptables -A INPUT -p udp --dport ${RDP_PORT} -j ACCEPT"
+    echo ""
+
+    echo -e "${BOLD}Check current firewall status:${NC}"
+    echo "  UFW:       sudo ufw status"
+    echo "  firewalld: sudo firewall-cmd --list-all"
+    echo "  iptables:  sudo iptables -L -n"
+    echo ""
+
+    # Try to detect and show current status
+    if command -v ufw &> /dev/null; then
+        echo -e "${BOLD}Your UFW status:${NC}"
+        sudo ufw status 2>/dev/null || echo "  (run with sudo to see status)"
+    elif command -v firewall-cmd &> /dev/null; then
+        echo -e "${BOLD}Your firewalld status:${NC}"
+        sudo firewall-cmd --list-ports 2>/dev/null || echo "  (run with sudo to see status)"
+    fi
+}
+
+# Show help
+show_help() {
+    show_banner
+    echo "Run Windows in Docker on Linux."
+    echo ""
+    echo "Usage: winbox <command>"
+    echo ""
+    echo -e "${BOLD}Commands:${NC}"
+    echo "  install    Interactive setup wizard for new Windows VM"
+    echo "  start      Start the Windows VM"
+    echo "  stop       Stop the Windows VM gracefully"
+    echo "  restart    Restart the Windows VM"
+    echo "  status     Show VM status, resource usage, and connection info"
+    echo "  logs       Show container logs (Ctrl+C to exit)"
+    echo "  config     Display current docker-compose.yml"
+    echo "  edit       Modify VM settings (RAM, CPU, ports)"
+    echo "  update     Check for and pull latest dockurr/windows image"
+    echo "  firewall   Show commands to open firewall ports for LAN access"
+    echo "  remove     Remove VM (keeps data directory)"
+    echo "  help       Show this help message"
+    echo ""
+    echo "For detailed documentation, see the header comments in this script."
+    echo ""
+}
+
+# Main
+case "$1" in
+    install)
+        install_windows
+        ;;
+    start)
+        start_vm
+        ;;
+    stop)
+        stop_vm
+        ;;
+    restart)
+        stop_vm
+        start_vm
+        ;;
+    status)
+        status_vm
+        ;;
+    logs)
+        show_logs
+        ;;
+    config)
+        show_config
+        ;;
+    edit)
+        edit_vm
+        ;;
+    update)
+        update_image
+        ;;
+    firewall)
+        show_firewall
+        ;;
+    remove)
+        remove_vm
+        ;;
+    help|--help|-h)
+        show_help
+        ;;
+    *)
+        show_help
+        exit 1
+        ;;
+esac
