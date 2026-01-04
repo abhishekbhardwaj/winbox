@@ -55,9 +55,11 @@ chmod +x winbox
 | `config` | Display current docker-compose.yml |
 | `edit` | Modify VM settings (RAM, CPU, ports) |
 | `update` | Pull latest dockur/windows image |
+| `self-update` | Update winbox script to the latest version |
 | `firewall` | Show commands to open ports for LAN access |
 | `remove-config` | Remove VM config (keeps data) |
 | `nuke` | Remove everything including VM data (destructive!) |
+| `version` | Show winbox version |
 
 ## Windows Versions
 
@@ -111,6 +113,28 @@ privileged: true
 ## License
 
 MIT
+
+## Development
+
+### Releasing a new version
+
+1. Bump the version:
+   ```bash
+   ./scripts/bump-version.sh patch  # 1.0.0 -> 1.0.1
+   ./scripts/bump-version.sh minor  # 1.0.0 -> 1.1.0
+   ./scripts/bump-version.sh major  # 1.0.0 -> 2.0.0
+   ```
+
+2. Commit and push:
+   ```bash
+   git add winbox
+   git commit -m "Bump version to X.Y.Z"
+   git push
+   ```
+
+3. GitHub Actions will automatically create a tagged release.
+
+Users can then update with `./winbox self-update`.
 
 ## Credits
 
