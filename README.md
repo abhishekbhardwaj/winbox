@@ -56,7 +56,8 @@ chmod +x winbox
 | `edit` | Modify VM settings (RAM, CPU, ports) |
 | `update` | Pull latest dockur/windows image |
 | `firewall` | Show commands to open ports for LAN access |
-| `remove` | Remove VM config (keeps data) |
+| `remove-config` | Remove VM config (keeps data) |
+| `nuke` | Remove everything including VM data (destructive!) |
 
 ## Windows Versions
 

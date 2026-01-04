@@ -26,18 +26,19 @@
 #   ./windows-docker-manager <command>
 #
 # COMMANDS:
-#   install   - Interactive setup wizard to configure and optionally start a
-#               new Windows VM. Creates docker-compose.yml with your settings.
-#   start     - Start the configured Windows VM container
-#   stop      - Gracefully stop the Windows VM (2 minute grace period)
-#   restart   - Stop and then start the VM
-#   status    - Show current container status and resource usage
-#   logs      - Show container logs (useful for debugging)
-#   config    - Display the current docker-compose.yml configuration
-#   edit      - Modify VM settings (RAM, CPU, disk, ports, etc.)
-#   firewall  - Show commands to open firewall ports for LAN access
-#   update    - Check for and pull latest dockurr/windows image
-#   remove    - Remove the VM container and config (keeps data directory)
+#   install       - Interactive setup wizard to configure and optionally start a
+#                   new Windows VM. Creates docker-compose.yml with your settings.
+#   start         - Start the configured Windows VM container
+#   stop          - Gracefully stop the Windows VM (2 minute grace period)
+#   restart       - Stop and then start the VM
+#   status        - Show current container status and resource usage
+#   logs          - Show container logs (useful for debugging)
+#   config        - Display the current docker-compose.yml configuration
+#   edit          - Modify VM settings (RAM, CPU, disk, ports, etc.)
+#   firewall      - Show commands to open firewall ports for LAN access
+#   update        - Check for and pull latest dockurr/windows image
+#   remove-config - Remove the VM container and config (keeps data directory)
+#   nuke          - Remove everything including VM data (destructive!)
 #
 # CONFIGURATION FILES:
 #   ~/.winbox/docker-compose.yml  - Generated compose file
@@ -1152,8 +1153,8 @@ show_config() {
     cat "$COMPOSE_FILE"
 }
 
-# Remove VM
-remove_vm() {
+# Remove VM config (keeps data)
+remove_config() {
     if [ ! -f "$COMPOSE_FILE" ]; then
         log_warn "No configuration found to remove."
         exit 0
@@ -1177,9 +1178,39 @@ remove_vm() {
         [ -d "$SHARED_DIR" ] && echo "  - $SHARED_DIR (shared folder)"
         [ -d "$OEM_DIR" ] && echo "  - $OEM_DIR (OEM scripts)"
         echo ""
-        echo "To completely remove all data, manually delete these directories."
+        echo "To completely remove everything, run '$0 nuke'"
     else
         log_info "Cancelled."
+    fi
+}
+
+# Nuke everything (destructive!)
+nuke_vm() {
+    echo ""
+    log_warn "This will PERMANENTLY DELETE everything:"
+    echo "  - VM container and configuration"
+    echo "  - Virtual disk and all Windows data"
+    echo "  - Shared folder contents"
+    echo "  - OEM scripts"
+    echo ""
+    echo -e "${RED}${BOLD}THIS CANNOT BE UNDONE!${NC}"
+    echo ""
+    read -p "Type 'nuke' to confirm: " CONFIRM
+    
+    if [ "$CONFIRM" == "nuke" ]; then
+        log_info "Stopping container..."
+        if [ -f "$COMPOSE_FILE" ]; then
+            docker compose -f "$COMPOSE_FILE" down 2>/dev/null
+        fi
+        
+        log_info "Removing all winbox data..."
+        rm -rf "$WINBOX_DIR"
+        
+        log_success "Everything has been removed."
+        echo ""
+        echo "Run '$0 install' to start fresh."
+    else
+        log_info "Cancelled. Nothing was deleted."
     fi
 }
 
@@ -1249,18 +1280,19 @@ show_help() {
     echo "Usage: winbox <command>"
     echo ""
     echo -e "${BOLD}Commands:${NC}"
-    echo "  install    Interactive setup wizard for new Windows VM"
-    echo "  start      Start the Windows VM"
-    echo "  stop       Stop the Windows VM gracefully"
-    echo "  restart    Restart the Windows VM"
-    echo "  status     Show VM status, resource usage, and connection info"
-    echo "  logs       Show container logs (Ctrl+C to exit)"
-    echo "  config     Display current docker-compose.yml"
-    echo "  edit       Modify VM settings (RAM, CPU, ports)"
-    echo "  update     Check for and pull latest dockurr/windows image"
-    echo "  firewall   Show commands to open firewall ports for LAN access"
-    echo "  remove     Remove VM (keeps data directory)"
-    echo "  help       Show this help message"
+    echo "  install        Interactive setup wizard for new Windows VM"
+    echo "  start          Start the Windows VM"
+    echo "  stop           Stop the Windows VM gracefully"
+    echo "  restart        Restart the Windows VM"
+    echo "  status         Show VM status, resource usage, and connection info"
+    echo "  logs           Show container logs (Ctrl+C to exit)"
+    echo "  config         Display current docker-compose.yml"
+    echo "  edit           Modify VM settings (RAM, CPU, ports)"
+    echo "  update         Check for and pull latest dockurr/windows image"
+    echo "  firewall       Show commands to open firewall ports for LAN access"
+    echo "  remove-config  Remove VM config (keeps data directory)"
+    echo "  nuke           Remove everything including VM data (destructive!)"
+    echo "  help           Show this help message"
     echo ""
     echo "For detailed documentation, see the header comments in this script."
     echo ""
@@ -1299,8 +1331,11 @@ case "$1" in
     firewall)
         show_firewall
         ;;
-    remove)
-        remove_vm
+    remove-config)
+        remove_config
+        ;;
+    nuke)
+        nuke_vm
         ;;
     help|--help|-h)
         show_help
